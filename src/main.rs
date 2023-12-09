@@ -3,9 +3,8 @@
 
 extern crate rv3028c7_rtc;
 
-use chrono::{Duration, NaiveTime};
 use core::ops::Add;
-use rv3028c7_rtc::{RV3028, DateTimeAccess, NaiveDateTime, NaiveDate};
+use rv3028c7_rtc::{RV3028, DateTimeAccess, Duration, NaiveDateTime, NaiveDate, NaiveTime, Datelike, Timelike, Weekday};
 
 use embedded_hal::blocking::i2c::{Write, Read, WriteRead};
 
@@ -34,6 +33,7 @@ use rp2040_hal::{
     // pac::I2C0,
     rtc::{self,  RealTimeClock},
 };
+use rp2040_hal::rtc::DayOfWeek;
 
 
 /// The linker will place this boot block at the start of our program image. We
@@ -92,20 +92,7 @@ fn main() -> ! {
 
     let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
-    let mut sys_rtc = hal::rtc::RealTimeClock::new(
-        pac.RTC,
-        clocks.rtc_clock,
-        &mut pac.RESETS,
-        rtc::DateTime {
-            year: 2023,
-            month: 12,
-            day: 8,
-            day_of_week: rtc::DayOfWeek::Friday,
-            hour: 15,
-            minute: 45,
-            second: 0,
-        },
-    ).unwrap();
+
 
     // Configure two pins as being I²C, not GPIO
     let sda_pin: Pin<_, FunctionI2C, PullUp> = pins.gpio4.reconfigure();
@@ -114,7 +101,7 @@ fn main() -> ! {
     // Create the I²C drive, using the two pre-configured pins. This will fail
     // at compile time if the pins are in the wrong mode, or if this I²C
     // peripheral isn't available on these pins!
-    let mut i2c = hal::I2C::i2c0(
+    let i2c = hal::I2C::i2c0(
         pac.I2C0,
         sda_pin,
         scl_pin, // Try `not_an_scl_pin` here
@@ -126,10 +113,16 @@ fn main() -> ! {
     // Create a new instance of the RV3028 driver
     let mut rtc = RV3028::new(i2c);
 
-    // use the set_datetime method to ensure all the timekeeping registers on
-    // the rtc are aligned to the same values
-    let dt_sys = rpi_rtc_datetime_to_duration(&sys_rtc.now().unwrap());
-    rtc.set_datetime(&dt_sys).unwrap();
+    // TODO probably this datetime should be set in the opposite direction,
+    // from external RTC to internal (since internal is known to be bogus)
+    let rtc_dt = rtc.datetime().unwrap();
+    let sys_dt = naive_datetime_to_rpico(&rtc_dt);
+    let mut sys_rtc = hal::rtc::RealTimeClock::new(
+        pac.RTC,
+        clocks.rtc_clock,
+        &mut pac.RESETS,
+        sys_dt,
+    ).unwrap();
 
 
     // Note that all RTC durations have a minimum uncertainty in the
@@ -148,26 +141,52 @@ fn main() -> ! {
     info!("\r\n==== PERIODICS ====");
     test_periodic_duration(&mut rtc, &Duration::microseconds(488), &mut delay, &mut sys_rtc).unwrap();
     test_periodic_duration(&mut rtc, &Duration::milliseconds(15 * (1000/15)), &mut delay, &mut sys_rtc).unwrap();
-    test_one_shot_duration(&mut rtc, &Duration::seconds(1), &mut delay, &mut sys_rtc).unwrap();
-    test_one_shot_duration(&mut rtc, &Duration::seconds(2), &mut delay, &mut sys_rtc).unwrap();
+    test_periodic_duration(&mut rtc, &Duration::seconds(1), &mut delay, &mut sys_rtc).unwrap();
+    test_periodic_duration(&mut rtc, &Duration::seconds(2), &mut delay, &mut sys_rtc).unwrap();
     test_periodic_duration(&mut rtc, &Duration::seconds(3), &mut delay, &mut sys_rtc).unwrap();
     // test_periodic_duration(&mut rtc, &Duration::minutes(1)).unwrap();
 
-
+    info!("=== DONE ===");
     loop {
         cortex_m::asm::wfi();
     }
 }
 
 
-fn rpi_rtc_datetime_to_duration(sys_dt: &rtc::DateTime) -> chrono::NaiveDateTime {
+fn rpico_datetime_to_naive(sys_dt: &rtc::DateTime) -> NaiveDateTime {
     NaiveDateTime::new(
         NaiveDate::from_ymd_opt(
             sys_dt.year as i32, sys_dt.month as u32, sys_dt.day as u32).unwrap(),
         NaiveTime::from_hms_opt(
             sys_dt.hour as u32, sys_dt.minute as u32 , sys_dt.second as u32).unwrap()
     )
+}
 
+
+fn rpico_weekday_from_naive(val: Weekday) -> rtc::DayOfWeek {
+    match val {
+        Weekday::Sun => DayOfWeek::Sunday,
+        Weekday::Mon => DayOfWeek::Monday,
+        Weekday::Tue => DayOfWeek::Tuesday,
+        Weekday::Wed => DayOfWeek::Wednesday,
+        Weekday::Thu => DayOfWeek::Thursday,
+        Weekday::Fri => DayOfWeek::Friday,
+        Weekday::Sat => DayOfWeek::Saturday,
+    }
+}
+
+
+
+fn naive_datetime_to_rpico(dt: &NaiveDateTime) -> rtc::DateTime {
+    rtc::DateTime {
+        year: dt.year().try_into().unwrap(),
+        month: dt.month().try_into().unwrap(),
+        day: dt.day().try_into().unwrap(),
+        day_of_week: rpico_weekday_from_naive(dt.weekday()),
+        hour: dt.hour().try_into().unwrap(),
+        minute: dt.minute().try_into().unwrap(),
+        second: dt.second().try_into().unwrap(),
+    }
 }
 
 fn test_one_shot_duration<I2C,E>(
@@ -189,23 +208,23 @@ fn test_one_shot_duration<I2C,E>(
           estimated_duration.add(Duration::milliseconds(16) )
       };
 
-    let start_time =    rpi_rtc_datetime_to_duration( &sys_rtc.now().unwrap());
+    let start_time =   rpico_datetime_to_naive( &sys_rtc.now().unwrap());
     rtc.toggle_countdown_timer(true)?;
-    delay.delay_ms(estimated_duration.num_milliseconds().try_into().unwrap());
+    delay.delay_us(expected_sleep.num_microseconds().unwrap() as u32);
 
     let actual = loop {
         let remain = rtc.get_countdown_value()?;
         if 0 == remain {
             let triggered = rtc.check_and_clear_countdown()?;
             if !triggered { println!("Counter zero but PERIODIC_TIMER_FLAG untriggered!!")}
-            let end_time = rpi_rtc_datetime_to_duration(&sys_rtc.now().unwrap());
+            let end_time = rpico_datetime_to_naive(&sys_rtc.now().unwrap());
             let delta = end_time - start_time;
             break delta;
         }
         else {
             // println!("remain: {}", remain);
             // 15.625 ms uncertainty
-            delay.delay_ms(1);
+            delay.delay_us(1000);
             // std::thread::sleep(Duration::milliseconds(1).to_std().unwrap());
         }
     };
@@ -237,15 +256,15 @@ fn test_periodic_duration<I2C,E>(
     const NUM_ITERATIONS: usize = 10;
 
     // start the countdown repeating
-    let mut start_time = rpi_rtc_datetime_to_duration(&sys_rtc.now().unwrap()); // Utc::now().naive_utc();
+    let mut start_time = rpico_datetime_to_naive(&sys_rtc.now().unwrap()); // Utc::now().naive_utc();
     rtc.toggle_countdown_timer(true)?;
     for _i in 0..NUM_ITERATIONS {
-        delay.delay_ms(estimated_duration.num_milliseconds().try_into().unwrap());
+        delay.delay_us(expected_sleep.num_microseconds().unwrap() as u32);
 
         let actual = loop {
             let triggered = rtc.check_and_clear_countdown()?;
             if triggered {
-                let end_time = rpi_rtc_datetime_to_duration( &sys_rtc.now().unwrap());
+                let end_time = rpico_datetime_to_naive( &sys_rtc.now().unwrap());
                 let delta = end_time - start_time;
                 start_time = end_time; //reset timer for next event
                 break delta;
